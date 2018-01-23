@@ -88,7 +88,7 @@ int main(int argc, char** argv)
         return test.global_result;
     }
     cout << "Sending rejoin commands for servers 3 & 4. Server 4 should not rejoin the cluster.\n";
-    const char REJOIN_CMD[] = "maxadmin call command mariadbmon rejoin MySQL-Monitor";
+    const string REJOIN_CMD = "maxadmin call command mariadbmon rejoin MySQL-Monitor";
     int ec;
     string rejoin_s3 = REJOIN_CMD + " server3";
     string rejoin_s4 = REJOIN_CMD + " server4";
