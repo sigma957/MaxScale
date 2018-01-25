@@ -1069,7 +1069,7 @@ static int write_log_entry(uint32_t data_flags, FILE *logfile, QLA_INSTANCE *ins
     {
         hasStats = stats.getPeriodData(instance->stats_window, numSel, numIns, numUpd, numDel);
         if (hasStats)
-            print_len += 4 * (integer_chars + 1) + 1;
+            print_len += 4 * (2 + integer_chars + 1) + 1;
     }
     if (print_len == 0)
     {
@@ -1150,7 +1150,7 @@ static int write_log_entry(uint32_t data_flags, FILE *logfile, QLA_INSTANCE *ins
     }
     if (!error && (data_flags & LOG_DATA_QUERY_STATS) && hasStats)
     {
-        if ((rval == sprintf(current_pos, "%d/%d/%d/%d", numSel, numIns, numUpd, numDel)) < 0)
+        if ((rval == sprintf(current_pos, "S:%d/I:%d/U:%d/D:%d", numSel, numIns, numUpd, numDel)) < 0)
         {
             error = true;
         }
