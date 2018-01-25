@@ -81,6 +81,76 @@ static json_t* diagnostic_json(const MXS_FILTER *instance, const MXS_FILTER_SESS
 static uint64_t getCapabilities(MXS_FILTER* instance);
 
 /**
+ * Helper class for managing query counts within a given timeframe
+ */
+class LOG_COUNT_DATA
+{
+    timespec begin_time; // Current timeframe starting point
+    int num_select;  // Number of SELECT statements processed within current time period
+    int num_insert;  // Number of INSERT statements processed within current time period
+    int num_update;  // Number of UPDATE statements processed within current time period
+    int num_delete;  // Number of DELETE statements processed within current time period
+
+    inline double getDeltaNano(const timespec &t1, const timespec &t2)
+    {
+        double dsec = t2.tv_sec - t1.tv_sec;
+        double dnano = t2.tv_nsec - t1.tv_nsec;
+        return dnano + dsec * 1e9f;
+    }
+
+    inline double getDeltaMilli(const timespec &t1, const timespec &t2)
+    {
+        return getDeltaNano(t1, t2) / 1e6f;
+    }
+
+public:
+    LOG_COUNT_DATA()
+    {
+        reset();
+    }
+
+    void reset()
+    {
+        num_select = 0;
+        num_insert = 0;
+        num_update = 0;
+        num_delete = 0;
+        clock_gettime(CLOCK_MONOTONIC, &begin_time);
+    }
+
+    bool getPeriodData(const int timePeriodMilli, int &numSelect, int &numInsert, int &numUpdate, int &numDelete)
+    {
+        timespec curr_time;
+        clock_gettime(CLOCK_MONOTONIC, &curr_time);
+        if (getDeltaMilli(begin_time, curr_time) < timePeriodMilli)
+            return false;
+        numSelect = num_select;
+        numInsert = num_insert;
+        numUpdate = num_update;
+        numDelete = num_delete;
+        reset();
+        return true;
+    }
+
+    void processQuery(const char *query, int queryLen)
+    {
+        if (!query || queryLen<=0)
+            return;
+        while(queryLen && (*query==' ' || *query=='\t'))
+        {
+            queryLen--;
+            query++;
+        }
+        if (!queryLen)
+            return;
+        num_select += strncasecmp("SELECT", query, queryLen) ? 0 : 1;
+        num_insert += strncasecmp("INSERT", query, queryLen) ? 0 : 1;
+        num_update += strncasecmp("UPDATE", query, queryLen) ? 0 : 1;
+        num_delete += strncasecmp("DELETE", query, queryLen) ? 0 : 1;
+    }
+};
+
+/**
  * A instance structure, the assumption is that the option passed
  * to the filter is simply a base for the filename to which the queries
  * are logged.
@@ -105,6 +175,7 @@ typedef struct
     FILE *unified_fp; /* Unified log file. The pointer needs to be shared here
                        * to avoid garbled printing. */
     char *unified_filename; /* Filename of the unified log file */
+    LOG_COUNT_DATA unified_counts; /* Unified counts of SELECT/INSERT/UPDATE/DELETE statements within current time period */
     bool flush_writes; /* Flush log file after every write? */
     bool append;    /* Open files in append-mode? */
 
@@ -154,6 +225,7 @@ typedef struct
     const char *user;   /* The client */
     pcre2_match_data* match_data; /* Regex match data */
     LOG_EVENT_DATA event_data; /* Information about the latest event, required if logging execution time. */
+    LOG_COUNT_DATA counts; /* Counts of SELECT/INSERT/UPDATE/DELETE statements within current time period */
 } QLA_SESSION;
 
 static FILE* open_log_file(uint32_t, QLA_INSTANCE *, const char *);
@@ -585,6 +657,9 @@ void write_log_entries(QLA_INSTANCE* my_instance, QLA_SESSION* my_session,
     bool write_error = false;
     if (my_instance->log_mode_flags & CONFIG_FILE_SESSION)
     {
+        // Collect SELECT/INSERT/UPDATE/DELETE counts for the session
+        my_session->counts.processQuery(query, querylen);
+
         // In this case there is no need to write the session
         // number into the files.
         uint32_t data_flags = (my_instance->log_file_data_flags &
@@ -597,6 +672,7 @@ void write_log_entries(QLA_INSTANCE* my_instance, QLA_SESSION* my_session,
     }
     if (my_instance->log_mode_flags & CONFIG_FILE_UNIFIED)
     {
+        my_instance->unified_counts.processQuery(query, querylen);
         uint32_t data_flags = my_instance->log_file_data_flags;
         if (write_log_entry(data_flags, my_instance->unified_fp, my_instance, my_session,
                             date_string, query, querylen, elapsed_ms) < 0)
