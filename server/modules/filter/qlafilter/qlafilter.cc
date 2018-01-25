@@ -56,16 +56,17 @@
 /* Flags for controlling extra log entry contents */
 enum log_options
 {
-    LOG_DATA_SERVICE    = (1 << 0),
-    LOG_DATA_SESSION    = (1 << 1),
-    LOG_DATA_DATE       = (1 << 2),
-    LOG_DATA_USER       = (1 << 3),
-    LOG_DATA_QUERY      = (1 << 4),
-    LOG_DATA_REPLY_TIME = (1 << 5),
+    LOG_DATA_SERVICE     = (1 << 0),
+    LOG_DATA_SESSION     = (1 << 1),
+    LOG_DATA_DATE        = (1 << 2),
+    LOG_DATA_USER        = (1 << 3),
+    LOG_DATA_QUERY       = (1 << 4),
+    LOG_DATA_QUERY_STATS = (1 << 5),
+    LOG_DATA_REPLY_TIME  = (1 << 6),
 };
 
 /* Default values for logged data */
-#define LOG_DATA_DEFAULT "date,user,query"
+#define LOG_DATA_DEFAULT "date,user,query,stats"
 
 /* The filter entry points */
 static MXS_FILTER *createInstance(const char *name, char **options, MXS_CONFIG_PARAMETER *);
@@ -81,9 +82,9 @@ static json_t* diagnostic_json(const MXS_FILTER *instance, const MXS_FILTER_SESS
 static uint64_t getCapabilities(MXS_FILTER* instance);
 
 /**
- * Helper class for managing query counts within a given timeframe
+ * Helper class for managing query stats within a given timeframe
  */
-class LOG_COUNT_DATA
+class LOG_STATS_DATA
 {
     timespec begin_time; // Current timeframe starting point
     int num_select;  // Number of SELECT statements processed within current time period
@@ -104,7 +105,7 @@ class LOG_COUNT_DATA
     }
 
 public:
-    LOG_COUNT_DATA()
+    LOG_STATS_DATA()
     {
         reset();
     }
@@ -120,9 +121,9 @@ public:
 
     bool getPeriodData(const int timePeriodMilli, int &numSelect, int &numInsert, int &numUpdate, int &numDelete)
     {
-        timespec curr_time;
+	timespec curr_time;
         clock_gettime(CLOCK_MONOTONIC, &curr_time);
-        if (getDeltaMilli(begin_time, curr_time) < timePeriodMilli)
+        if (timePeriodMilli <= 0 || getDeltaMilli(begin_time, curr_time)<timePeriodMilli)
             return false;
         numSelect = num_select;
         numInsert = num_insert;
@@ -136,7 +137,7 @@ public:
     {
         if (!query || queryLen<=0)
             return;
-        while(queryLen && (*query==' ' || *query=='\t'))
+        while(queryLen && (*query == ' ' || *query == '\t'))
         {
             queryLen--;
             query++;
@@ -175,7 +176,8 @@ typedef struct
     FILE *unified_fp; /* Unified log file. The pointer needs to be shared here
                        * to avoid garbled printing. */
     char *unified_filename; /* Filename of the unified log file */
-    LOG_COUNT_DATA unified_counts; /* Unified counts of SELECT/INSERT/UPDATE/DELETE statements within current time period */
+    LOG_STATS_DATA unified_stats; /* Unified stats of SELECT/INSERT/UPDATE/DELETE statements within current time period */
+    int stats_window; /* Time period for which to accumulate SELECT/INSERT/UPDATE/DELETE statement stats (0=disabled) */
     bool flush_writes; /* Flush log file after every write? */
     bool append;    /* Open files in append-mode? */
 
@@ -225,12 +227,12 @@ typedef struct
     const char *user;   /* The client */
     pcre2_match_data* match_data; /* Regex match data */
     LOG_EVENT_DATA event_data; /* Information about the latest event, required if logging execution time. */
-    LOG_COUNT_DATA counts; /* Counts of SELECT/INSERT/UPDATE/DELETE statements within current time period */
+    LOG_STATS_DATA stats; /* Counts of SELECT/INSERT/UPDATE/DELETE statements within current time period */
 } QLA_SESSION;
 
 static FILE* open_log_file(uint32_t, QLA_INSTANCE *, const char *);
 static int write_log_entry(uint32_t, FILE*, QLA_INSTANCE*, QLA_SESSION*,
-                           const char*, const char*, size_t, int);
+                           const char*, const char*, size_t, int, LOG_STATS_DATA &);
 static bool cb_log(const MODULECMD_ARG *argv, json_t** output);
 
 static const MXS_ENUM_VALUE option_values[] =
@@ -256,6 +258,7 @@ static const MXS_ENUM_VALUE log_data_values[] =
     {"user",        LOG_DATA_USER},
     {"query",       LOG_DATA_QUERY},
     {"reply_time",  LOG_DATA_REPLY_TIME},
+    {"stats",       LOG_DATA_QUERY_STATS},
     {NULL}
 };
 
@@ -267,6 +270,7 @@ static const char PARAM_FILEBASE[] = "filebase";
 static const char PARAM_OPTIONS[] = "options";
 static const char PARAM_LOG_TYPE[] = "log_type";
 static const char PARAM_LOG_DATA[] = "log_data";
+static const char PARAM_LOG_STATS_WINDOW[] = "stats_window";
 static const char PARAM_FLUSH[] = "flush";
 static const char PARAM_APPEND[] = "append";
 
@@ -373,6 +377,11 @@ MXS_MODULE* MXS_CREATE_MODULE()
                 log_data_values
             },
             {
+                PARAM_LOG_STATS_WINDOW,
+                MXS_MODULE_PARAM_INT,
+                0
+            },
+            {
                 PARAM_FLUSH,
                 MXS_MODULE_PARAM_BOOL,
                 "false"
@@ -422,6 +431,7 @@ createInstance(const char *name, char **options, MXS_CONFIG_PARAMETER *params)
         my_instance->flush_writes = config_get_bool(params, PARAM_FLUSH);
         my_instance->log_file_data_flags = config_get_enum(params, PARAM_LOG_DATA, log_data_values);
         my_instance->log_mode_flags = config_get_enum(params, PARAM_LOG_TYPE, log_type_values);
+        my_instance->stats_window = config_get_integer(params, PARAM_LOG_STATS_WINDOW);
 
         my_instance->match = config_copy_string(params, PARAM_MATCH);
         my_instance->exclude = config_copy_string(params, PARAM_EXCLUDE);
@@ -657,25 +667,25 @@ void write_log_entries(QLA_INSTANCE* my_instance, QLA_SESSION* my_session,
     bool write_error = false;
     if (my_instance->log_mode_flags & CONFIG_FILE_SESSION)
     {
-        // Collect SELECT/INSERT/UPDATE/DELETE counts for the session
-        my_session->counts.processQuery(query, querylen);
+        // Collect SELECT/INSERT/UPDATE/DELETE stats for the session
+        my_session->stats.processQuery(query, querylen);
 
         // In this case there is no need to write the session
         // number into the files.
         uint32_t data_flags = (my_instance->log_file_data_flags &
                                ~LOG_DATA_SESSION);
         if (write_log_entry(data_flags, my_session->fp, my_instance, my_session,
-                            date_string, query, querylen, elapsed_ms) < 0)
+                            date_string, query, querylen, elapsed_ms, my_session->stats) < 0)
         {
             write_error = true;
         }
     }
     if (my_instance->log_mode_flags & CONFIG_FILE_UNIFIED)
     {
-        my_instance->unified_counts.processQuery(query, querylen);
+        my_instance->unified_stats.processQuery(query, querylen);
         uint32_t data_flags = my_instance->log_file_data_flags;
         if (write_log_entry(data_flags, my_instance->unified_fp, my_instance, my_session,
-                            date_string, query, querylen, elapsed_ms) < 0)
+                            date_string, query, querylen, elapsed_ms, my_instance->unified_stats) < 0)
         {
             write_error = true;
         }
@@ -928,6 +938,7 @@ static FILE* open_log_file(uint32_t data_flags, QLA_INSTANCE *instance, const ch
         const char USERHOST[] = "User@Host,";
         const char QUERY[] = "Query,";
         const char REPLY_TIME[] = "Reply_time,";
+        const char STATS[] = "Query counts (S/I/U/D),";
         const int headerlen = sizeof(SERVICE) + sizeof(SERVICE) + sizeof(DATE) +
                               sizeof(USERHOST) + sizeof(QUERY) + sizeof(REPLY_TIME);
 
@@ -964,6 +975,14 @@ static FILE* open_log_file(uint32_t data_flags, QLA_INSTANCE *instance, const ch
         {
             strcat(current_pos, QUERY);
             current_pos += sizeof(QUERY) - 1;
+        }
+        if (instance->log_file_data_flags & LOG_DATA_QUERY_STATS)
+        {
+            if (instance->stats_window>0)
+            {
+              strcat(current_pos, STATS);
+              current_pos += sizeof(STATS) - 1;
+            }
         }
         if (current_pos > print_str)
         {
@@ -1002,11 +1021,12 @@ static FILE* open_log_file(uint32_t data_flags, QLA_INSTANCE *instance, const ch
  * @param   sql_string    SQL-query, *not* NULL terminated
  * @param   sql_str_len   Length of SQL-string
  * @param   elapsed_ms    Query execution time, in milliseconds
+ * @param   stats         SELECT/INSERT/UPDATE/DELETE stats
  * @return  The number of characters written, or a negative value on failure
  */
 static int write_log_entry(uint32_t data_flags, FILE *logfile, QLA_INSTANCE *instance,
                            QLA_SESSION *session, const char *time_string, const char *sql_string,
-                           size_t sql_str_len, int elapsed_ms)
+                           size_t sql_str_len, int elapsed_ms, LOG_STATS_DATA &stats)
 {
     ss_dassert(logfile != NULL);
     size_t print_len = 0;
@@ -1019,6 +1039,8 @@ static int write_log_entry(uint32_t data_flags, FILE *logfile, QLA_INSTANCE *ins
 
     // The numbers have some extra for delimiters.
     const size_t integer_chars = 20; // Enough space for any integer type
+    int numSel, numIns, numUpd, numDel;
+    bool hasStats = false;
     if (data_flags & LOG_DATA_SERVICE)
     {
         print_len += strlen(session->service) + 1;
@@ -1043,7 +1065,12 @@ static int write_log_entry(uint32_t data_flags, FILE *logfile, QLA_INSTANCE *ins
     {
         print_len += sql_str_len + 1; // Can't use strlen, not null-terminated
     }
-
+    if (data_flags & LOG_DATA_QUERY_STATS)
+    {
+        hasStats = stats.getPeriodData(instance->stats_window, numSel, numIns, numUpd, numDel);
+        if (hasStats)
+            print_len += 4 * (integer_chars + 1) + 1;
+    }
     if (print_len == 0)
     {
         return 0; // Nothing to print
@@ -1120,6 +1147,17 @@ static int write_log_entry(uint32_t data_flags, FILE *logfile, QLA_INSTANCE *ins
     {
         strncat(current_pos, sql_string, sql_str_len); // non-null-terminated string
         current_pos += sql_str_len + 1; // +1 to move to the next char after
+    }
+    if (!error && (data_flags & LOG_DATA_QUERY_STATS) && hasStats)
+    {
+        if ((rval == sprintf(current_pos, "%d/%d/%d/%d", numSel, numIns, numUpd, numDel)) < 0)
+        {
+            error = true;
+        }
+        else
+        {
+            current_pos += rval;
+        }
     }
     if (error || current_pos <= print_str)
     {
