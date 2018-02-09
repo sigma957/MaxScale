@@ -90,78 +90,116 @@ static uint64_t getCapabilities(MXS_FILTER* instance);
 /**
  * Helper class for managing query stats within a given timeframe
  */
-class LOG_STATS_DATA
+struct LOG_STATS_DATA
 {
-    timespec begin_time; // Current time period starting point
-    int num_select;  // Number of SELECT statements processed within current time period
-    int num_insert;  // Number of INSERT statements processed within current time period
-    int num_update;  // Number of UPDATE statements processed within current time period
-    int num_delete;  // Number of DELETE statements processed within current time period
+    FILE* log; // output log file
+    int wid; // index of current window
+    int numClaims; // number of window-close claims by worker threads
+    int numSelect, numInsert, numUpdate, numDelete; // stats data
 
-    inline double getTimeDeltaNano(const timespec &t1, const timespec &t2)
+    LOG_STATS_DATA(const int currWID): numClaims(0) { reset(currWID); }
+
+    bool claim() { return !atomic_add(&numClaims, 1); }
+    void revoke() { atomic_add(&numClaims, -numClaims); }
+    
+    LOG_STATS_DATA 
+    reset(const int newWID)
     {
-        double dsec = t2.tv_sec - t1.tv_sec;
-        double dnano = t2.tv_nsec - t1.tv_nsec;
-        return dnano + dsec * 1e9f;
+        LOG_STATS_DATA stats = *this;
+        atomic_add(&wid, newWID - wid);
+        atomic_add(&numSelect, -numSelect);
+        atomic_add(&numInsert, -numInsert);
+        atomic_add(&numUpdate, -numUpdate);
+        atomic_add(&numDelete, -numDelete);
+        return stats;
     }
 
-    inline double getTimeDeltaMilli(const timespec &t1, const timespec &t2)
+    void 
+    processQuery(const char *query, int queryLen)
     {
-        return getTimeDeltaNano(t1, t2) / 1e6f;
+        if (!query || queryLen <= 0)
+            return;
+        while(queryLen > 0 && isWhitespace(*query))
+        {
+            queryLen--;
+            query++;
+        }
+        if (queryLen < 2 || (*query == '-' && *(query + 1) == '-'))
+            return; //skip void queries
+        if(*query == '/' && *(query + 1) == '*')
+        {
+            //skip comment
+            query += 4;
+            queryLen -= 4;
+            while(queryLen > 1 && !isEndComment(query - 2, queryLen))
+            {
+                queryLen--;
+                query++;
+            }
+            while(queryLen > 0 && isWhitespace(*query))
+            {
+                queryLen--;
+                query++;
+            }
+        }
+        if (queryLen <= 0)
+            return;
+        if (isMatching("select", query, queryLen))
+            atomic_add(&numSelect, 1);
+        else if (isMatching("insert", query, queryLen))
+            atomic_add(&numInsert, 1);
+        else if (isMatching("update", query, queryLen))
+            atomic_add(&numUpdate, 1);
+        else if (isMatching("delete", query, queryLen))
+            atomic_add(&numDelete, 1);
     }
 
-    inline bool isMatching(const char* pattern, const char *query, const int queryLen)
+private:
+    inline bool
+    isEndComment(const char* str, const int len)
+    {
+        return len >= 2 && *str == '*' && *(str+1) == '/';
+    }
+
+    inline bool
+    isLineBreak(const char c)
+    {
+        bool isLB = false;
+        switch(c)
+        {
+        case '\r':
+        case '\n':
+            isLB = true;
+        }
+            return isLB;
+    }
+
+    inline bool
+    isSpace(const char c)
+    {
+        bool isSpace = false;
+        switch(c)
+        {
+        case ' ':
+        case '\t':
+            isSpace = true;
+        }
+        return isSpace;
+    }
+    
+    inline bool
+    isWhitespace(const char c)
+    {
+        return isSpace(c) || isLineBreak(c);
+    }
+
+    inline bool
+    isMatching(const char* pattern, const char *query, const int queryLen)
     {
         int len = strlen(pattern);
         if (len > queryLen)
           len = queryLen;
         return !strncasecmp(pattern,query,len);
-    }
-
-public:
-    LOG_STATS_DATA()
-    {
-        reset();
-    }
-
-    void reset()
-    {
-        num_select = 0;
-        num_insert = 0;
-        num_update = 0;
-        num_delete = 0;
-        clock_gettime(CLOCK_MONOTONIC, &begin_time);
-    }
-
-    bool getForPeriod(const int timePeriodMilli, int &numSelect, int &numInsert, int &numUpdate, int &numDelete)
-    {
-	timespec curr_time;
-        clock_gettime(CLOCK_MONOTONIC, &curr_time);
-        if (timePeriodMilli > 0 && getTimeDeltaMilli(begin_time, curr_time) < timePeriodMilli)
-            return false;
-        numSelect = num_select;
-        numInsert = num_insert;
-        numUpdate = num_update;
-        numDelete = num_delete;
-        reset();
-        return true;
-    }
-
-    void processQuery(const char *query, int queryLen)
-    {
-        if (!query || queryLen <= 0)
-            return;
-        while(queryLen > 0 && (*query == ' ' || *query == '\t'))
-        {
-            queryLen--;
-            query++;
-        }
-        if (!queryLen)
-            return;
-        num_select += isMatching("select", query, queryLen) ? 1 : 0;
-        num_insert += isMatching("insert", query, queryLen) ? 1 : 0;
-        num_update += isMatching("update", query, queryLen) ? 1 : 0;
-        num_delete += isMatching("delete", query, queryLen) ? 1 : 0;
     }
 };
 
@@ -190,13 +228,17 @@ typedef struct
     FILE *unified_fp; /* Unified log file. The pointer needs to be shared here
                        * to avoid garbled printing. */
     char *unified_filename; /* Filename of the unified log file */
-    LOG_STATS_DATA unified_stats; /* Unified stats of SELECT/INSERT/UPDATE/DELETE statements within current time period */
     int stats_window; /* Time period for which to accumulate SELECT/INSERT/UPDATE/DELETE statement stats (0=no window) */
     bool flush_writes; /* Flush log file after every write? */
     bool append;    /* Open files in append-mode? */
 
     /* Avoid repeatedly printing some errors/warnings. */
     bool write_warning_given;
+    LOG_STATS_DATA* unified_stats; /* Unified stats of SELECT/INSERT/UPDATE/DELETE statements within current time period */
+    int unified_wid_base; /* Stats windows global base */
+    FILE *unified_fp_stats; /* Unified stats log file. The pointer needs to be shared here
+                       * to avoid garbled printing. */
+    char *unified_filename_stats; /* Filename of the unified stats log file */
 } QLA_INSTANCE;
 
 /**
@@ -241,12 +283,16 @@ typedef struct
     const char *user;   /* The client */
     pcre2_match_data* match_data; /* Regex match data */
     LOG_EVENT_DATA event_data; /* Information about the latest event, required if logging execution time. */
-    LOG_STATS_DATA stats; /* Stats of SELECT/INSERT/UPDATE/DELETE statements within current time period */
+    LOG_STATS_DATA* stats; /* Stats of SELECT/INSERT/UPDATE/DELETE statements within current time period */
+    char *filename_stats; /* The session-specific stats log file name */
+    FILE *fp_stats;       /* The session-specific stats log file */
 } QLA_SESSION;
 
 static FILE* open_log_file(uint32_t, QLA_INSTANCE *, const char *);
+static FILE* open_stats_log_file(uint32_t, QLA_INSTANCE *, const char *);
 static int write_log_entry(uint32_t, FILE*, QLA_INSTANCE*, QLA_SESSION*,
-                           const char*, const char*, size_t, int, LOG_STATS_DATA &);
+                           const char*, const char*, size_t, int);
+static int write_stats_log_entry(uint32_t, FILE*, QLA_INSTANCE*, QLA_SESSION*, LOG_STATS_DATA*);
 static bool cb_log(const MODULECMD_ARG *argv, json_t** output);
 
 static const MXS_ENUM_VALUE option_values[] =
@@ -435,6 +481,9 @@ createInstance(const char *name, char **options, MXS_CONFIG_PARAMETER *params)
         my_instance->ovec_size = 0;
         my_instance->unified_fp = NULL;
         my_instance->unified_filename = NULL;
+        my_instance->unified_fp_stats = NULL;
+        my_instance->unified_filename_stats = NULL;
+        my_instance->unified_stats = NULL;
         my_instance->write_warning_given = false;
 
         my_instance->source = config_copy_string(params, PARAM_SOURCE);
@@ -464,15 +513,23 @@ createInstance(const char *name, char **options, MXS_CONFIG_PARAMETER *params)
         }
 
         // Try to open the unified log file
+        timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        my_instance->unified_wid_base = now.tv_sec * 1000 / my_instance->stats_window; //ms
         if (!error && (my_instance->log_mode_flags & CONFIG_FILE_UNIFIED))
-        {
+        { 
             // First calculate filename length
             const char UNIFIED[] = ".unified";
+            const char STATS[] = "_stats";
             int namelen = strlen(my_instance->filebase) + sizeof(UNIFIED);
+            int namelen_stats = namelen + sizeof(STATS);
             char *filename = NULL;
-            if ((filename = (char*)MXS_CALLOC(namelen, sizeof(char))) != NULL)
+            char *filename_stats = NULL;
+            if ((filename = (char*)MXS_CALLOC(namelen, sizeof(char))) != NULL &&
+                (filename_stats = (char*)MXS_CALLOC(namelen_stats, sizeof(char))) != NULL)
             {
-                snprintf(filename, namelen, "%s.unified", my_instance->filebase);
+                snprintf(filename, namelen, "%s%s", my_instance->filebase, UNIFIED);
+                snprintf(filename_stats, namelen_stats, "%s%s%s", my_instance->filebase, STATS, UNIFIED);
                 // Open the file. It is only closed at program exit
                 my_instance->unified_fp = open_log_file(my_instance->log_file_data_flags,
                                                         my_instance, filename);
@@ -480,6 +537,7 @@ createInstance(const char *name, char **options, MXS_CONFIG_PARAMETER *params)
                 if (my_instance->unified_fp == NULL)
                 {
                     MXS_FREE(filename);
+                    MXS_FREE(filename_stats);
                     MXS_ERROR("Opening output file for qla-filter failed due to %d, %s",
                               errno, mxs_strerror(errno));
                     error = true;
@@ -487,6 +545,25 @@ createInstance(const char *name, char **options, MXS_CONFIG_PARAMETER *params)
                 else
                 {
                     my_instance->unified_filename = filename;
+                    if (my_instance->log_file_data_flags & LOG_DATA_QUERY_STATS)
+                    {
+                        // Open the stats log file. It is only closed at program exit
+                        my_instance->unified_stats = new(MXS_CALLOC(sizeof(LOG_STATS_DATA), sizeof(char)))LOG_STATS_DATA(my_instance->unified_wid_base);
+                        my_instance->unified_fp_stats = open_stats_log_file(my_instance->log_file_data_flags, my_instance, filename_stats);
+                        if (my_instance->unified_stats == NULL || my_instance->unified_fp_stats == NULL)
+                        {
+                            MXS_FREE(filename);
+                            MXS_FREE(filename_stats);
+                            MXS_FREE(my_instance->unified_stats);
+                            MXS_ERROR("Opening output file for qla-filter stats failed due to %d, %s",
+                                      errno, mxs_strerror(errno));
+                            error = true;
+                        }
+                        else
+                        {
+                            my_instance->unified_filename_stats = filename_stats;
+                        }
+                    }
                 }
             }
             else
@@ -505,6 +582,10 @@ createInstance(const char *name, char **options, MXS_CONFIG_PARAMETER *params)
             if (my_instance->unified_fp != NULL)
             {
                 fclose(my_instance->unified_fp);
+            }
+            if (my_instance->unified_fp_stats != NULL)
+            {
+                fclose(my_instance->unified_fp_stats);
             }
             MXS_FREE(my_instance->filebase);
             MXS_FREE(my_instance->source);
@@ -532,20 +613,23 @@ newSession(MXS_FILTER *instance, MXS_SESSION *session)
     QLA_SESSION *my_session;
     const char *remote, *userName;
 
+    const char* STATS = "_stats";
     if ((my_session = (QLA_SESSION*)MXS_CALLOC(1, sizeof(QLA_SESSION))) != NULL)
     {
         my_session->fp = NULL;
         my_session->match_data = NULL;
         my_session->filename = (char *)MXS_MALLOC(strlen(my_instance->filebase) + 20);
+        my_session->filename_stats = (char *)MXS_MALLOC(strlen(my_instance->filebase) + strlen(STATS) + 20);
         const uint32_t ovec_size = my_instance->ovec_size;
         if (ovec_size)
         {
             my_session->match_data = pcre2_match_data_create(ovec_size, NULL);
         }
 
-        if (!my_session->filename || (ovec_size && !my_session->match_data))
+        if (!my_session->filename || !my_session->filename_stats || (ovec_size && !my_session->match_data))
         {
             MXS_FREE(my_session->filename);
+            MXS_FREE(my_session->filename_stats);
             pcre2_match_data_free(my_session->match_data);
             MXS_FREE(my_session);
             return NULL;
@@ -572,6 +656,9 @@ newSession(MXS_FILTER *instance, MXS_SESSION *session)
         sprintf(my_session->filename, "%s.%lu",
                 my_instance->filebase,
                 my_session->ses_id);
+        sprintf(my_session->filename_stats, "%s%s.%lu", 
+                my_instance->filebase, STATS, 
+                my_session->ses_id);
 
         // Multiple sessions can try to update my_instance->sessions simultaneously
         atomic_add(&(my_instance->sessions), 1);
@@ -582,15 +669,31 @@ newSession(MXS_FILTER *instance, MXS_SESSION *session)
             uint32_t data_flags = (my_instance->log_file_data_flags &
                                    ~LOG_DATA_SESSION); // No point printing "Session"
             my_session->fp = open_log_file(data_flags, my_instance, my_session->filename);
-
             if (my_session->fp == NULL)
             {
                 MXS_ERROR("Opening output file for qla-filter failed due to %d, %s",
                           errno, mxs_strerror(errno));
                 MXS_FREE(my_session->filename);
+                MXS_FREE(my_session->filename_stats);
                 pcre2_match_data_free(my_session->match_data);
                 MXS_FREE(my_session);
                 my_session = NULL;
+            }
+            else if (data_flags & LOG_DATA_QUERY_STATS)
+            {
+                my_session->stats = new(MXS_CALLOC(sizeof(LOG_STATS_DATA), sizeof(char)))LOG_STATS_DATA(my_instance->unified_wid_base);
+                my_session->fp_stats = open_stats_log_file(data_flags, my_instance, my_session->filename_stats);
+                if (my_session->stats == NULL || my_session->fp_stats == NULL)
+                {
+                    MXS_ERROR("Opening output stats file for qla-filter failed due to %d, %s",
+                              errno, mxs_strerror(errno));
+                    MXS_FREE(my_session->filename);
+                    MXS_FREE(my_session->filename_stats);
+                    MXS_FREE(my_session->stats);
+                    pcre2_match_data_free(my_session->match_data);
+                    MXS_FREE(my_session);
+                    my_session = NULL;
+                }
             }
         }
     }
@@ -608,11 +711,18 @@ newSession(MXS_FILTER *instance, MXS_SESSION *session)
 static void
 closeSession(MXS_FILTER *instance, MXS_FILTER_SESSION *session)
 {
+    QLA_INSTANCE *my_instance = (QLA_INSTANCE *)instance;
     QLA_SESSION *my_session = (QLA_SESSION *) session;
 
-    if (my_session->active && my_session->fp)
+    if (my_session->active)
     {
-        fclose(my_session->fp);
+        if (my_session->fp)
+           fclose(my_session->fp);
+        if (my_instance->log_file_data_flags & LOG_DATA_QUERY_STATS)
+        {
+            if (my_session->fp_stats)
+               fclose(my_session->fp_stats);
+        }
     }
     clear(my_session->event_data);
 }
@@ -626,9 +736,15 @@ closeSession(MXS_FILTER *instance, MXS_FILTER_SESSION *session)
 static void
 freeSession(MXS_FILTER *instance, MXS_FILTER_SESSION *session)
 {
+    QLA_INSTANCE *my_instance = (QLA_INSTANCE *)instance;
     QLA_SESSION *my_session = (QLA_SESSION *) session;
 
     MXS_FREE(my_session->filename);
+    if (my_instance->log_file_data_flags & LOG_DATA_QUERY_STATS)
+    {
+        MXS_FREE(my_session->filename_stats);
+        MXS_FREE(my_session->stats);
+    }
     pcre2_match_data_free(my_session->match_data);
     MXS_FREE(session);
     return;
@@ -683,10 +799,9 @@ void write_log_entries(QLA_INSTANCE* my_instance, QLA_SESSION* my_session,
     {
         // In this case there is no need to write the session
         // number into the files.
-        uint32_t data_flags = (my_instance->log_file_data_flags &
-                               ~LOG_DATA_SESSION);
+        uint32_t data_flags = (my_instance->log_file_data_flags & ~LOG_DATA_SESSION);
         if (write_log_entry(data_flags, my_session->fp, my_instance, my_session,
-                            date_string, query, querylen, elapsed_ms, my_session->stats) < 0)
+                            date_string, query, querylen, elapsed_ms) < 0)
         {
             write_error = true;
         }
@@ -695,7 +810,7 @@ void write_log_entries(QLA_INSTANCE* my_instance, QLA_SESSION* my_session,
     {
         uint32_t data_flags = my_instance->log_file_data_flags;
         if (write_log_entry(data_flags, my_instance->unified_fp, my_instance, my_session,
-                            date_string, query, querylen, elapsed_ms, my_instance->unified_stats) < 0)
+                            date_string, query, querylen, elapsed_ms) < 0)
         {
             write_error = true;
         }
@@ -709,6 +824,57 @@ void write_log_entries(QLA_INSTANCE* my_instance, QLA_SESSION* my_session,
     }
 }
 
+/**
+ * Write QLA stats log entry/entries to disk
+ *
+ * @param my_instance Filter instance
+ * @param my_session Filter session
+ * @param stats The statistics object
+ */
+void write_stats_log_entries(QLA_INSTANCE* my_instance, QLA_SESSION* my_session, LOG_STATS_DATA stats)
+{
+    bool write_error = false;
+    uint32_t data_flags = my_instance->log_file_data_flags;
+    if (my_instance->log_mode_flags & CONFIG_FILE_SESSION)
+    {
+        if (write_stats_log_entry(data_flags, my_session->fp_stats, my_instance, my_session, my_session->stats) < 0)
+        {
+          write_error = true;
+        }
+    }
+    if (my_instance->log_mode_flags & CONFIG_FILE_UNIFIED)
+        if (write_stats_log_entry(data_flags, my_instance->unified_fp_stats, my_instance, my_session, my_instance->unified_stats) < 0)
+        {
+            write_error = true;
+        }
+    if (write_error && !my_instance->write_warning_given)
+    {
+        MXS_ERROR("qla-filter '%s': Stats Log file write failed. "
+                  "Suppressing further similar warnings.",
+                  my_instance->name);
+        my_instance->write_warning_given = true;
+    }
+}
+
+/**
+ * Updates the given stats with the given query
+ *
+ * @param instance  The filter instance data
+ * @param session   The filter session
+ * @param stats     The statistics object
+ * @param currWID   Current time Window ID
+ * @param query     The query data
+ * @param queryLen  The query length
+ */
+void updateStats(QLA_INSTANCE *instance, QLA_SESSION *session, LOG_STATS_DATA* stats, const int currWID, const char* query, int queryLen) {
+    if (stats->wid < currWID && stats->claim())
+    {
+        write_stats_log_entries(instance, session, stats->reset(currWID));
+        stats->revoke();
+    }
+    stats->processQuery(query, queryLen);
+}
+	
 /**
  * The routeQuery entry point. This is passed the query buffer
  * to which the filter should be applied. Once applied the
@@ -765,7 +931,19 @@ routeQuery(MXS_FILTER *instance, MXS_FILTER_SESSION *session, GWBUF *queue)
             // If execution times are not logged, write the log entry now.
             write_log_entries(my_instance, my_session, query, query_len, event.query_date, -1);
         }
+		
+        if (data_flags & LOG_DATA_QUERY_STATS)
+        {
+            timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            const int currWID = now.tv_sec * 1000 / my_instance->stats_window; //ms
+            if (my_instance->log_mode_flags & CONFIG_FILE_UNIFIED)
+                updateStats(my_instance, my_session, my_instance->unified_stats, currWID, query, query_len);
+            if (my_instance->log_mode_flags & CONFIG_FILE_SESSION)
+                updateStats(my_instance, my_session, my_session->stats, currWID, query, query_len);
+        }
     }
+
     /* Pass the query downstream */
     return my_session->down.routeQuery(my_session->down.instance,
                                        my_session->down.session, queue);
@@ -987,11 +1165,6 @@ static FILE* open_log_file(uint32_t data_flags, QLA_INSTANCE *instance, const ch
             strcat(current_pos, QUERY);
             current_pos += sizeof(QUERY) - 1;
         }
-        if (instance->log_file_data_flags & LOG_DATA_QUERY_STATS)
-        {
-            strcat(current_pos, QUERY_STATS);
-            current_pos += sizeof(QUERY_STATS) - 1;
-        }
         if (current_pos > print_str)
         {
             // Overwrite the last ','.
@@ -1002,6 +1175,70 @@ static FILE* open_log_file(uint32_t data_flags, QLA_INSTANCE *instance, const ch
             // Nothing to print
             return fp;
         }
+
+        // Finally, write the log header.
+        int written = fprintf(fp, "%s", print_str);
+
+        if ((written <= 0) ||
+            ((instance->flush_writes) && (fflush(fp) < 0)))
+        {
+            // Weird error, file opened but a write failed. Best to stop.
+            fclose(fp);
+            MXS_ERROR("Failed to print header to file %s.", filename);
+            return NULL;
+        }
+    }
+    return fp;
+}
+
+/**
+ * Open the stats log file and print a header if appropriate.
+ * @param   data_flags  Data save settings flags
+ * @param   instance    The filter instance
+ * @param   filename    Target file path
+ * @return  A valid file on success, null otherwise.
+ */
+static FILE* open_stats_log_file(uint32_t data_flags, QLA_INSTANCE *instance, const char *filename)
+{
+    bool file_existed = false;
+    FILE *fp = NULL;
+    if (instance->append == false)
+    {
+        // Just open the file (possibly overwriting) and then print header.
+        fp = fopen(filename, "w");
+    }
+    else
+    {
+        /**
+         *  Using fopen() with 'a+' means we will always write to the end but can read
+         *  anywhere. Depending on the "append"-setting the file has been
+         *  opened in different modes, which should be considered if file handling
+         *  changes later (e.g. rewinding).
+         */
+        if ((fp = fopen(filename, "a+")) != NULL)
+        {
+            // Check to see if file already has contents
+            fseek(fp, 0, SEEK_END);
+            if (ftell(fp) > 0) // Any errors in ftell cause overwriting
+            {
+                file_existed = true;
+            }
+        }
+    }
+    if (fp && !file_existed)
+    {
+        // Print a header. Luckily, we know the header has limited length
+        const char START[] = "Start,";
+        const char END[] = "End,";
+        const char NUM_SELECT[] = "numSELECT,";
+        const char NUM_INSERT[] = "numINSERT,";
+        const char NUM_UPDATE[] = "numUPDATE,";
+        const char NUM_DELETE[] = "numDELETE";
+        const int headerlen = sizeof(START) + sizeof(END) + 
+                              sizeof(NUM_SELECT) + sizeof(NUM_INSERT) + sizeof(NUM_UPDATE) + sizeof(NUM_DELETE);
+
+        char print_str[headerlen];
+		snprintf(print_str, headerlen, "%s%s%s%s%s%s\n", START, END, NUM_SELECT, NUM_INSERT, NUM_UPDATE, NUM_DELETE);
 
         // Finally, write the log header.
         int written = fprintf(fp, "%s", print_str);
@@ -1034,11 +1271,8 @@ static FILE* open_log_file(uint32_t data_flags, QLA_INSTANCE *instance, const ch
  */
 static int write_log_entry(uint32_t data_flags, FILE *logfile, QLA_INSTANCE *instance,
                            QLA_SESSION *session, const char *time_string, const char *sql_string,
-                           size_t sql_str_len, int elapsed_ms, LOG_STATS_DATA &stats)
+                           size_t sql_str_len, int elapsed_ms)
 {
-    // Update SELECT/INSERT/UPDATE/DELETE stats
-    stats.processQuery(sql_string, sql_str_len);
-
     ss_dassert(logfile != NULL);
     size_t print_len = 0;
     /**
@@ -1078,12 +1312,6 @@ static int write_log_entry(uint32_t data_flags, FILE *logfile, QLA_INSTANCE *ins
     if (data_flags & LOG_DATA_QUERY)
     {
         print_len += sql_str_len + 1; // Can't use strlen, not null-terminated
-    }
-    if (data_flags & LOG_DATA_QUERY_STATS)
-    {
-        hasStats = stats.getForPeriod(instance->stats_window, numSelect, numInsert, numUpdate, numDelete);
-        if (hasStats)
-            print_len += 4 * (integer_chars + 1);
     }
     if (print_len == 0)
     {
@@ -1163,17 +1391,6 @@ static int write_log_entry(uint32_t data_flags, FILE *logfile, QLA_INSTANCE *ins
         current_pos += sql_str_len + 1; // +1 to move to the next char after
         *(current_pos - 1) = ',';
     }
-    if (!error && (data_flags & LOG_DATA_QUERY_STATS) && hasStats)
-    {
-        if ((rval = sprintf(current_pos, "%d,%d,%d,%d,", numSelect, numInsert, numUpdate, numDelete)) < 0)
-        {
-            error = true;
-        }
-        else
-        {
-           current_pos += rval;
-        }
-    }
     if (error || current_pos <= print_str)
     {
         MXS_FREE(print_str);
@@ -1205,6 +1422,48 @@ static int write_log_entry(uint32_t data_flags, FILE *logfile, QLA_INSTANCE *ins
         return rval;
     }
 }
+
+static int write_stats_log_entry(uint32_t data_flags, FILE *logfile, QLA_INSTANCE *instance,
+                           QLA_SESSION *session, LOG_STATS_DATA* stats)
+{
+    // Calculate an upper limit for the total length and allocate row buffer
+    ss_dassert(logfile != NULL);
+    ss_dassert(stats != NULL);
+    const size_t date_chars = 40; // Enough space for any datetime type
+    const size_t integer_chars = 20; // Enough space for any integer type
+    size_t print_len = 2 * date_chars + 4 * integer_chars; //start+end, select+insert+update+delete
+    char *print_str = NULL;
+    if ((print_str = (char*)MXS_CALLOC(print_len, sizeof(char))) == NULL)
+    {
+        return -1;
+    }
+    
+    // Generate period data
+    int start = stats->wid * instance->stats_window;
+    snprintf(print_str, print_len, "%d,%d,%d,%d,%d,%d\n", //TODO: print date
+            start, start + instance->stats_window, //TODO: print date
+            stats->numSelect, stats->numInsert, stats->numUpdate, stats->numDelete);
+    
+    // Finally, write the stats log event.
+    int written = fprintf(logfile, "%s", print_str);
+    MXS_FREE(print_str);
+
+    if ((!instance->flush_writes) || (written <= 0))
+    {
+        return written;
+    }
+    else
+    {
+        // Try flushing. If successful, still return the characters written.
+        int rval = fflush(logfile);
+        if (rval >= 0)
+        {
+            return written;
+        }
+        return rval;
+    }
+}
+
 
 static bool cb_log(const MODULECMD_ARG *argv, json_t** output)
 {
