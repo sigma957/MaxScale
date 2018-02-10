@@ -92,7 +92,6 @@ static uint64_t getCapabilities(MXS_FILTER* instance);
  */
 struct LOG_STATS_DATA
 {
-    FILE* log; // output log file
     int wid; // index of current window
     int numClaims; // number of window-close claims by worker threads
     int numSelect, numInsert, numUpdate, numDelete; // stats data
@@ -119,31 +118,40 @@ struct LOG_STATS_DATA
     {
         if (!query || queryLen <= 0)
             return;
-        while(queryLen > 0 && isWhitespace(*query))
+        for (bool hasComment = true; hasComment; )
         {
-            queryLen--;
-            query++;
-        }
-        if (queryLen < 2 || (*query == '-' && *(query + 1) == '-'))
-            return; //skip void queries
-        if(*query == '/' && *(query + 1) == '*')
-        {
-            //skip comment
-            query += 4;
-            queryLen -= 4;
-            while(queryLen > 1 && !isEndComment(query - 2, queryLen))
-            {
-                queryLen--;
-                query++;
-            }
+            hasComment = false;
             while(queryLen > 0 && isWhitespace(*query))
             {
+                //skip whitespace
                 queryLen--;
                 query++;
             }
+            if (queryLen < 2)
+                return;
+            if (*query == '-' && *(query + 1) == '-')
+            {
+                //skip single-line comments
+                while(queryLen > 0 && !isLineBreak(*query))
+                {
+                   queryLen--;
+                   query++;
+                }
+                hasComment = true;
+            }
+            else if (*query == '/' && *(query + 1) == '*')
+            {
+                //skip multiline comment (eat up closing chars to avoid confusions)
+                query += 4;
+                queryLen -= 4;
+                while(queryLen > 1 && !isEndComment(query - 2, queryLen))
+                {
+                    queryLen--;
+                    query++;
+                }
+                hasComment = true;
+            }
         }
-        if (queryLen <= 0)
-            return;
         if (isMatching("select", query, queryLen))
             atomic_add(&numSelect, 1);
         else if (isMatching("insert", query, queryLen))
@@ -515,7 +523,7 @@ createInstance(const char *name, char **options, MXS_CONFIG_PARAMETER *params)
         // Try to open the unified log file
         timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
-        my_instance->unified_wid_base = now.tv_sec * 1000 / my_instance->stats_window; //ms
+        my_instance->unified_wid_base = now.tv_sec / my_instance->stats_window;
         if (!error && (my_instance->log_mode_flags & CONFIG_FILE_UNIFIED))
         { 
             // First calculate filename length
@@ -936,7 +944,7 @@ routeQuery(MXS_FILTER *instance, MXS_FILTER_SESSION *session, GWBUF *queue)
         {
             timespec now;
             clock_gettime(CLOCK_MONOTONIC, &now);
-            const int currWID = now.tv_sec * 1000 / my_instance->stats_window; //ms
+            const int currWID = now.tv_sec / my_instance->stats_window;
             if (my_instance->log_mode_flags & CONFIG_FILE_UNIFIED)
                 updateStats(my_instance, my_session, my_instance->unified_stats, currWID, query, query_len);
             if (my_instance->log_mode_flags & CONFIG_FILE_SESSION)
@@ -1233,12 +1241,12 @@ static FILE* open_stats_log_file(uint32_t data_flags, QLA_INSTANCE *instance, co
         const char NUM_SELECT[] = "numSELECT,";
         const char NUM_INSERT[] = "numINSERT,";
         const char NUM_UPDATE[] = "numUPDATE,";
-        const char NUM_DELETE[] = "numDELETE";
+        const char NUM_DELETE[] = "numDELETE\n";
         const int headerlen = sizeof(START) + sizeof(END) + 
                               sizeof(NUM_SELECT) + sizeof(NUM_INSERT) + sizeof(NUM_UPDATE) + sizeof(NUM_DELETE);
 
         char print_str[headerlen];
-		snprintf(print_str, headerlen, "%s%s%s%s%s%s\n", START, END, NUM_SELECT, NUM_INSERT, NUM_UPDATE, NUM_DELETE);
+		snprintf(print_str, headerlen, "%s%s%s%s%s%s", START, END, NUM_SELECT, NUM_INSERT, NUM_UPDATE, NUM_DELETE);
 
         // Finally, write the log header.
         int written = fprintf(fp, "%s", print_str);
@@ -1439,10 +1447,16 @@ static int write_stats_log_entry(uint32_t data_flags, FILE *logfile, QLA_INSTANC
     }
     
     // Generate period data
-    int start = stats->wid * instance->stats_window;
-    snprintf(print_str, print_len, "%d,%d,%d,%d,%d,%d\n", //TODO: print date
-            start, start + instance->stats_window, //TODO: print date
-            stats->numSelect, stats->numInsert, stats->numUpdate, stats->numDelete);
+    tm tmStart, tmEnd;
+    char strStart[40], strEnd[40];
+    const time_t utcStart = stats->wid * instance->stats_window; //sec
+    const time_t utcEnd = utcStart + instance->stats_window; //sec
+    localtime_r(&utcStart, &tmStart);
+    localtime_r(&utcEnd, &tmEnd);
+    strftime(strStart, sizeof(strStart) - 1, "%F %T", &tmStart);
+    strftime(strEnd, sizeof(strEnd) - 1, "%F %T", &tmEnd);
+    snprintf(print_str, print_len, "%s,%s,%d,%d,%d,%d\n",
+            strStart, strEnd, stats->numSelect, stats->numInsert, stats->numUpdate, stats->numDelete);
     
     // Finally, write the stats log event.
     int written = fprintf(logfile, "%s", print_str);
