@@ -25,11 +25,11 @@ filters=MyLogFilter
 
 The QLA filter accepts the following options.
 
- Option | Description
- -------| -----------
+   Option   | Description
+------------|--------------
  ignorecase | Use case-insensitive matching
- case | Use case-sensitive matching
- extended | Use extended regular expression syntax (ERE)
+ case       | Use case-sensitive matching
+ extended   | Use extended regular expression syntax (ERE)
 
 To use multiple filter options, list them in a comma-separated list. If no options are given, default will be used. Multiple options can be enabled simultaneously.
 
@@ -116,21 +116,30 @@ Type of data to log in the log files. Parameter value is a comma separated list
 of the following values. By default the _date_, _user_ and _query_ options are
 enabled.
 
-| Value       | Description                                      |
-| --------    |--------------------------------------------------|
-| service     | Service name                                     |
-| session     | Unique session id (ignored for session files)    |
-| date        | Timestamp                                        |
-| user        | User and hostname of client                      |
-| reply_time  | Response time (ms until first reply from server) |
-| query       | Query                                            |
+| Value       | Description                                        |
+| --------    |----------------------------------------------------|
+| service     | Service name                                       |
+| session     | Unique session id (ignored for session files)      |
+| date        | Timestamp                                          |
+| user        | User and hostname of client                        |
+| reply_time  | Response time (ms until first reply from server)   |
+| query       | Query                                              |
+| stats       | SELECT/INSERT/UPDATE/DELETE counts in separate log |
 
 ```
-log_data=date, user, query
+log_data=date, user, query, stats
 ```
 
 If *reply_time* is enabled, the log entry is written when the first reply from server is received.
 Otherwise, the entry is written when receiving query from client.
+
+### `stats_window`
+
+Specifies the window (in seconds) of statistics logger. Default value is 60.
+
+```
+stats_window=5
+```
 
 ### `flush`
 

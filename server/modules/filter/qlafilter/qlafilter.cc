@@ -444,7 +444,7 @@ MXS_MODULE* MXS_CREATE_MODULE()
             {
                 PARAM_LOG_STATS_WINDOW,
                 MXS_MODULE_PARAM_INT,
-                0
+                60
             },
             {
                 PARAM_FLUSH,
