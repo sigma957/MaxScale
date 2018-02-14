@@ -239,6 +239,7 @@ typedef struct
                        * to avoid garbled printing. */
     char *unified_filename; /* Filename of the unified log file */
     int stats_window; /* Time period for which to accumulate SELECT/INSERT/UPDATE/DELETE statement stats (0=no window) */
+    bool filter_stats; /* Specified whether to log periods with empty stats or not (leading window ignores this flag and is always logged) */
     bool flush_writes; /* Flush log file after every write? */
     bool append;    /* Open files in append-mode? */
 
@@ -336,6 +337,7 @@ static const char PARAM_OPTIONS[] = "options";
 static const char PARAM_LOG_TYPE[] = "log_type";
 static const char PARAM_LOG_DATA[] = "log_data";
 static const char PARAM_LOG_STATS_WINDOW[] = "stats_window";
+static const char PARAM_LOG_FILTER_STATS[] = "filter_stats";
 static const char PARAM_FLUSH[] = "flush";
 static const char PARAM_APPEND[] = "append";
 
@@ -444,7 +446,12 @@ MXS_MODULE* MXS_CREATE_MODULE()
             {
                 PARAM_LOG_STATS_WINDOW,
                 MXS_MODULE_PARAM_INT,
-                60
+                "60"
+            },
+            {
+                PARAM_LOG_FILTER_STATS,
+                MXS_MODULE_PARAM_BOOL,
+                "true"
             },
             {
                 PARAM_FLUSH,
@@ -498,6 +505,7 @@ createInstance(const char *name, char **options, MXS_CONFIG_PARAMETER *params)
         my_instance->log_file_data_flags = config_get_enum(params, PARAM_LOG_DATA, log_data_values);
         my_instance->log_mode_flags = config_get_enum(params, PARAM_LOG_TYPE, log_type_values);
         my_instance->stats_window = config_get_integer(params, PARAM_LOG_STATS_WINDOW);
+        my_instance->filter_stats = config_get_bool(params, PARAM_LOG_FILTER_STATS);
 
         my_instance->match = config_copy_string(params, PARAM_MATCH);
         my_instance->exclude = config_copy_string(params, PARAM_EXCLUDE);
@@ -846,14 +854,14 @@ void write_log_entries(QLA_INSTANCE* my_instance, QLA_SESSION* my_session,
 void updateStats(QLA_INSTANCE *instance, QLA_SESSION *session, LOG_STATS_DATA* stats, const int currWID, const char* query, int queryLen) {
     if (stats->wid < currWID && stats->claim())
     {
-        if (write_stats_log_entry(instance, session, stats) < 0 && !instance->write_warning_given)
-        {
-            MXS_ERROR("qla-filter '%s': Stats Log file write failed. "
-                  "Suppressing further similar warnings.",
-                  instance->name);
-            instance->write_warning_given = true;
-
-        }
+        for(int lastWID = instance->filter_stats ? stats->wid + 1 : currWID; stats->wid < lastWID; stats->reset(stats->wid + 1))
+            if (write_stats_log_entry(instance, session, stats) < 0 && !instance->write_warning_given)
+            {
+                MXS_ERROR("qla-filter '%s': Stats Log file write failed. "
+                      "Suppressing further similar warnings.",
+                      instance->name);
+                instance->write_warning_given = true;
+            }
         stats->reset(currWID);
         stats->revoke();
     }
